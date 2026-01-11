@@ -3,13 +3,10 @@ from firebase_functions.options import set_global_options
 from firebase_functions import firestore_fn, https_fn
 # The Firebase Admin SDK to access Cloud Firestore.
 from firebase_admin import initialize_app, firestore
-import google.cloud.firestore
-import os
 import json
 from google import genai
 from google.genai import types
 from unstructured.partition.html import partition_html
-from io import BytesIO
 
 # For cost control, you can set the maximum number of containers that can be
 # running at the same time. This helps mitigate the impact of unexpected
@@ -19,49 +16,6 @@ from io import BytesIO
 set_global_options(max_instances=10)
 
 initialize_app()
-
-
-@https_fn.on_request()
-def addmessage(req: https_fn.Request) -> https_fn.Response:
-    """Take the url parameter passed to this HTTP endpoint and insert it into
-    a new document in the urls collection."""
-    # Grab the url parameter.
-    original = req.args.get("url")
-    userId = req.args.get("userId")
-    if original is None:
-        return https_fn.Response("No url parameter provided", status=400)
-    if userId is None:
-        return https_fn.Response("No userId parameter provided", status=400)
-
-    firestore_client: google.cloud.firestore.Client = firestore.client()
-
-    # Push the new message into Cloud Firestore using the Firebase Admin SDK.
-    _, doc_ref = firestore_client.collection(f"users/{userId}/properties").add({"sourceUrl": original})
-
-    # Send back a message that we've successfully written the message
-    return https_fn.Response(f"Property with ID {doc_ref.id} added.")
-
-
-@firestore_fn.on_document_created(document="users/{userId}/properties/{propertyId}")
-def makeuppercase(event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None]) -> None:
-    """Listens for new documents to be added to /users/{userId}/properties/{propertyId}. If the document has
-    an "url" field, creates an "uppercase" field containg the contents of
-    "url" in upper case."""
-
-    # Get the value of "url" if it exists.
-    if event.data is None:
-        return
-    try:
-        original = event.data.get("sourceUrl")
-    except KeyError:
-        # No "url" field, so do nothing.
-        return
-
-    # Set the "uppercase" field.
-    print(f"Uppercasing {event.params['propertyId']}: {original}")
-    upper = original.upper()
-    event.data.reference.update({"uppercaseSourceUrl": upper})
-
 
 @https_fn.on_request(memory=512, timeout_sec=60)
 def extract_property_info(req: https_fn.Request) -> https_fn.Response:
@@ -174,3 +128,24 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     except Exception as e:
         print(f"Error calling Gemini: {e}")
         return https_fn.Response(f"AI processing error: {str(e)}", status=500)
+
+
+@firestore_fn.on_document_created(document="users/{userId}")
+def user_created(event: firestore_fn.DocumentSnapshot) -> None:
+    """
+    Add additional fields to a newly created user document
+    """
+    try:
+        
+        user_data = {
+            "email": event.data.get("email"),
+            "displayName": event.data.get("displayName"),
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "isAdmin": False
+        }
+        
+        event.data.reference.set(user_data)
+        print(f"Created user document for {event.data.get('email')}")
+
+    except Exception as e:
+        print(f"Error creating user document: {e}")
