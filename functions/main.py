@@ -1,12 +1,13 @@
 from firebase_functions.options import set_global_options
 # The Cloud Functions for Firebase SDK to create Cloud Functions and set up triggers.
-from firebase_functions import firestore_fn, https_fn
+from firebase_functions import firestore_fn, https_fn, options
 # The Firebase Admin SDK to access Cloud Firestore.
 from firebase_admin import initialize_app, firestore
 import json
 from google import genai
 from google.genai import types
 from unstructured.partition.html import partition_html
+from unstructured.cleaners.core import clean
 
 # For cost control, you can set the maximum number of containers that can be
 # running at the same time. This helps mitigate the impact of unexpected
@@ -17,7 +18,7 @@ set_global_options(max_instances=10)
 
 initialize_app()
 
-@https_fn.on_request(memory=512, timeout_sec=60)
+@https_fn.on_request(memory=512, timeout_sec=60, cors=options.CorsOptions(cors_origins="*", cors_methods=["post"]))
 def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     """
     Receives an HTML file, url, and userId.
@@ -60,12 +61,19 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     try:
         # partition_html can take text directly
         elements = partition_html(text=html_content)
+        cleaned_elements = []
+        for el in elements:
+            cleaned_el = clean(el.text, extra_whitespace=True)
+            if cleaned_el.strip():
+                cleaned_elements.append(el)
         # Combine elements into a single string for the context
-        clean_text = "\n\n".join([str(el) for el in elements])
+        clean_text = "\n\n".join([str(el) for el in cleaned_elements])
+        # return https_fn.Response(clean_text, mimetype='text/plain', status=200)
     except Exception as e:
         print(f"Error partitioning HTML: {e}")
         # Build a safe fallback if unstructured fails (though it shouldn't for simple HTML)
         clean_text = html_content[:50000] # truncate if raw
+        # return https_fn.Response(clean_text, mimetype='text/plain', status=200)
 
     # 4. Call Gemini
     try:
@@ -107,23 +115,8 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
                 result_json = json.loads(text_resp)
             except:
                 result_json = {"error": "Failed to parse JSON from AI response", "raw": response.text}
-
-        # 5. Store in Firestore
-        if "error" not in result_json:
-            try:
-                db = firestore.client()
-                db.collection(f"users/{user_id}/properties").add(result_json)
-            except Exception as fe:
-                print(f"Error saving to Firestore: {fe}")
-
-        # 6. Return Usage
-        usage = response.usage_metadata
         
-        return https_fn.Response(json.dumps({
-            "total_tokens": usage.total_token_count,
-            "input_tokens": usage.prompt_token_count,
-            "output_tokens": usage.candidates_token_count
-        }), mimetype='application/json')
+        return https_fn.Response(json.dumps(result_json), mimetype='application/json')                
 
     except Exception as e:
         print(f"Error calling Gemini: {e}")
