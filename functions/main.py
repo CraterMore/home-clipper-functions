@@ -6,8 +6,9 @@ from firebase_admin import initialize_app, firestore
 import json
 from google import genai
 from google.genai import types
-from unstructured.partition.html import partition_html
-from unstructured.cleaners.core import clean
+import asyncio
+from crawl4ai import AsyncWebCrawler
+from crawl4ai.async_configs import CrawlerRunConfig, CacheMode
 
 # For cost control, you can set the maximum number of containers that can be
 # running at the same time. This helps mitigate the impact of unexpected
@@ -17,6 +18,18 @@ from unstructured.cleaners.core import clean
 set_global_options(max_instances=10)
 
 initialize_app()
+
+async def crawl_raw_html(html_content):
+    raw_html_url = f"raw:{html_content}"
+    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+
+    async with AsyncWebCrawler() as crawler:
+        result = await crawler.arun(url=raw_html_url, config=config)
+        if result.success:
+            return result.markdown
+        else:
+            print(f"Failed to crawl raw HTML: {result.error_message}")
+            return ""
 
 @https_fn.on_request(memory=512, timeout_sec=60, cors=options.CorsOptions(cors_origins="*", cors_methods=["post"]))
 def extract_property_info(req: https_fn.Request) -> https_fn.Response:
@@ -59,16 +72,7 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
 
     # 3. Partition HTML using unstructured
     try:
-        # partition_html can take text directly
-        elements = partition_html(text=html_content)
-        cleaned_elements = []
-        for el in elements:
-            cleaned_el = clean(el.text, extra_whitespace=True)
-            if cleaned_el.strip():
-                cleaned_elements.append(el)
-        # Combine elements into a single string for the context
-        clean_text = "\n\n".join([str(el) for el in cleaned_elements])
-        # return https_fn.Response(clean_text, mimetype='text/plain', status=200)
+        clean_text = asyncio.run(crawl_raw_html(html_content))
     except Exception as e:
         print(f"Error partitioning HTML: {e}")
         # Build a safe fallback if unstructured fails (though it shouldn't for simple HTML)
