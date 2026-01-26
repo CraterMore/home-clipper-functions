@@ -1,99 +1,71 @@
 from firebase_functions.options import set_global_options
 # The Cloud Functions for Firebase SDK to create Cloud Functions and set up triggers.
-from firebase_functions import firestore_fn, https_fn
+from firebase_functions import firestore_fn, https_fn, options
 # The Firebase Admin SDK to access Cloud Firestore.
-from firebase_admin import initialize_app, firestore
-import google.cloud.firestore
-import os
+from firebase_admin import initialize_app, firestore, auth
 import json
 from google import genai
 from google.genai import types
-from unstructured.partition.html import partition_html
-from io import BytesIO
+import asyncio
+from crawl4ai import AsyncWebCrawler
+from crawl4ai.async_configs import CrawlerRunConfig, CacheMode
 
-# For cost control, you can set the maximum number of containers that can be
-# running at the same time. This helps mitigate the impact of unexpected
-# traffic spikes by instead downgrading performance. This limit is a per-function
-# limit. You can override the limit for each function using the max_instances
-# parameter in the decorator, e.g. @https_fn.on_request(max_instances=5).
 set_global_options(max_instances=10)
 
 initialize_app()
 
+async def crawl_raw_html(html_content):
+    raw_html_url = f"raw:{html_content}"
+    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
 
-@https_fn.on_request()
-def addmessage(req: https_fn.Request) -> https_fn.Response:
-    """Take the url parameter passed to this HTTP endpoint and insert it into
-    a new document in the urls collection."""
-    # Grab the url parameter.
-    original = req.args.get("url")
-    userId = req.args.get("userId")
-    if original is None:
-        return https_fn.Response("No url parameter provided", status=400)
-    if userId is None:
-        return https_fn.Response("No userId parameter provided", status=400)
+    async with AsyncWebCrawler() as crawler:
+        result = await crawler.arun(url=raw_html_url, config=config)
+        if result.success:
+            return result.markdown
+        else:
+            raise Exception("Failed to crawl raw HTML: " + result.error_message)
 
-    firestore_client: google.cloud.firestore.Client = firestore.client()
-
-    # Push the new message into Cloud Firestore using the Firebase Admin SDK.
-    _, doc_ref = firestore_client.collection(f"users/{userId}/properties").add({"sourceUrl": original})
-
-    # Send back a message that we've successfully written the message
-    return https_fn.Response(f"Property with ID {doc_ref.id} added.")
-
-
-@firestore_fn.on_document_created(document="users/{userId}/properties/{propertyId}")
-def makeuppercase(event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None]) -> None:
-    """Listens for new documents to be added to /users/{userId}/properties/{propertyId}. If the document has
-    an "url" field, creates an "uppercase" field containg the contents of
-    "url" in upper case."""
-
-    # Get the value of "url" if it exists.
-    if event.data is None:
-        return
-    try:
-        original = event.data.get("sourceUrl")
-    except KeyError:
-        # No "url" field, so do nothing.
-        return
-
-    # Set the "uppercase" field.
-    print(f"Uppercasing {event.params['propertyId']}: {original}")
-    upper = original.upper()
-    event.data.reference.update({"uppercaseSourceUrl": upper})
-
-
-@https_fn.on_request(memory=512, timeout_sec=60)
+@https_fn.on_request(memory=512, timeout_sec=30, cors=options.CorsOptions(cors_origins="*", cors_methods=["post"]))
 def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     """
     Receives an HTML file, url, and userId.
     Parses HTML using unstructured, extracts property info using Gemini.
     """
+    auth_header = req.headers.get("Authorization")
+    if not auth_header:
+        return https_fn.Response("Missing 'Authorization' header.", status=401)
+
+    token = auth_header.split("Bearer ")[1]
+    try:
+        user_data = auth.verify_id_token(token, check_revoked=True)
+    except Exception as e:
+        return https_fn.Response("Invalid 'Authorization' header.", status=403)
+
+    # Initialize Gemini client
     client = genai.Client()
 
-    # 1. Parse parameters (URL, userId)
+    # 1. Parse parameters (URL)
     url = req.args.get("url")
-    user_id = req.args.get("userId")
 
-    if not url or not user_id:
-        return https_fn.Response("Missing 'url' or 'userId' parameter.", status=400)
+    if not url:
+        return https_fn.Response("Missing 'url' parameter.", status=400)
 
     # 2. Get HTML content
     html_content = ""
     try:
         # Check for file upload
-        if req.files and 'file' in req.files:
-            file_storage = req.files['file']
-            html_content = file_storage.read().decode('utf-8', errors='ignore')
-        # Check for file in a different key if 'file' missing but files exist
-        elif req.files:
-            # Just take the first file
-            for key in req.files:
-                html_content = req.files[key].read().decode('utf-8', errors='ignore')
-                break
-        # Fallback to raw body if content type suggests text/html or generic
-        elif req.data:
-            html_content = req.data.decode('utf-8', errors='ignore')
+        # if req.files and 'file' in req.files:
+        #     file_storage = req.files['file']
+        #     html_content = file_storage.read().decode('utf-8', errors='ignore')
+        # # Check for file in a different key if 'file' missing but files exist
+        # elif req.files:
+        #     # Just take the first file
+        #     for key in req.files:
+        #         html_content = req.files[key].read().decode('utf-8', errors='ignore')
+        #         break
+        # # Fallback to raw body if content type suggests text/html or generic
+        # elif req.data:
+        html_content = req.data.decode('utf-8', errors='ignore')
         
     except Exception as e:
         print(f"Error reading HTML content: {e}")
@@ -104,12 +76,9 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
 
     # 3. Partition HTML using unstructured
     try:
-        # partition_html can take text directly
-        elements = partition_html(text=html_content)
-        # Combine elements into a single string for the context
-        clean_text = "\n\n".join([str(el) for el in elements])
+        clean_text = asyncio.run(crawl_raw_html(html_content))
     except Exception as e:
-        print(f"Error partitioning HTML: {e}")
+        print(str(e))
         # Build a safe fallback if unstructured fails (though it shouldn't for simple HTML)
         clean_text = html_content[:50000] # truncate if raw
 
@@ -118,23 +87,23 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
         
         prompt = f"""
         You are an expert data extractor. given the text from a property listing website below, extract the following fields:
+        - Address (output as a string)
         - Price (output as a number)
         - Number of bedrooms (output as a number)
         - Number of bathrooms (output as a number)
-        - Address (output as a string)
-        
+
         Source URL: {url}
 
         Return the data in the following JSON format ONLY:
         {{
             "sourceURL": "{url}",
-            "address": "...",
+            "address": "27 Main St, Anytown, AB 12345",
             "price": 100000,
             "bedrooms": 2,
             "bathrooms": 1
         }}
 
-        If a field is missing, use null or 0.
+        If a field is missing, use null for strings or 0 for numbers. If the content does not appear to be a property listing, return null for all fields.
 
         Listing Content:
         {clean_text}
@@ -153,24 +122,29 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
                 result_json = json.loads(text_resp)
             except:
                 result_json = {"error": "Failed to parse JSON from AI response", "raw": response.text}
-
-        # 5. Store in Firestore
-        if "error" not in result_json:
-            try:
-                db = firestore.client()
-                db.collection(f"users/{user_id}/properties").add(result_json)
-            except Exception as fe:
-                print(f"Error saving to Firestore: {fe}")
-
-        # 6. Return Usage
-        usage = response.usage_metadata
         
-        return https_fn.Response(json.dumps({
-            "total_tokens": usage.total_token_count,
-            "input_tokens": usage.prompt_token_count,
-            "output_tokens": usage.candidates_token_count
-        }), mimetype='application/json')
+        return https_fn.Response(json.dumps(result_json), mimetype='application/json', status=200)                
 
     except Exception as e:
         print(f"Error calling Gemini: {e}")
         return https_fn.Response(f"AI processing error: {str(e)}", status=500)
+
+
+@firestore_fn.on_document_created(document="users/{userId}")
+def user_created(event: firestore_fn.DocumentSnapshot) -> None:
+    """
+    Add additional fields to a newly created user document
+    """
+    try:
+        
+        user_data = {
+            "email": event.data.get("email"),
+            "displayName": event.data.get("displayName"),
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "isAdmin": False
+        }
+        
+        event.data.reference.set(user_data)
+
+    except Exception as e:
+        print(f"Error creating user document: {e}")
