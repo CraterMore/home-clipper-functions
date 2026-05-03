@@ -5,34 +5,48 @@ from firebase_functions import firestore_fn, https_fn, options
 from firebase_admin import initialize_app, firestore, auth
 import json
 import os
+import pathlib
 from google import genai
 from google.genai import types
 import asyncio
-from crawl4ai import AsyncWebCrawler
-from crawl4ai.async_configs import CrawlerRunConfig, CacheMode, BrowserConfig
-from playwright.async_api import async_playwright
+from crawl4ai.docker_client import Crawl4aiDockerClient
+from crawl4ai.async_configs import CrawlerRunConfig, CacheMode
 
 set_global_options(max_instances=10)
 
 initialize_app()
 
+# --- GLOBAL SCOPE: Runs once per instance ---
+# Fake browser is used to bypass playwright browser check.
+# Cloud Functions for Firebase uses a sandbox environment that doesn't support browser automation.
+# This fix involves creating a dummy browser executable in the expected location, tricking Playwright into thinking a browser is present.
+def setup_fake_browser():
+    custom_pw_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH')
+    
+    # Target path for the "fake" chrome
+    fake_dir = pathlib.Path(custom_pw_path) / "chromium-1208" / "chrome-linux64"
+    fake_exe = fake_dir / "chrome"
+    
+    # Only create if it's not already there from a previous warm start
+    if not fake_exe.exists():
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        with open(fake_exe, "w") as f:
+            f.write("#!/bin/sh\nexit 0")
+        os.chmod(fake_exe, 0o755)
+
+# Trigger the setup immediately when the function container starts
+setup_fake_browser()
+
 async def crawl_raw_html(html_content):
     raw_html_url = f"raw:{html_content}"
-    browserless_api_key = os.getenv("BROWSERLESS_API_KEY")
-    async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(f"wss://production-sfo.browserless.io?token={browserless_api_key}")
+    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, excluded_tags=['form', 'footer', 'nav'], excluded_selector='.subMarketSection, .mapSection, .nearbySection, .schoolsSection, .profileV2TransportationSection, .walkScoreSection, .profileV2NearbyAmenitiesSection, .profileFooterWrapper')
 
-        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, excluded_tags=['form', 'footer', 'nav'], excluded_selector='.subMarketSection, .mapSection, .nearbySection, .schoolsSection, .profileV2TransportationSection, .walkScoreSection, .profileV2NearbyAmenitiesSection, .profileFooterWrapper')
-
-        try:
-            async with AsyncWebCrawler(browser=browser) as crawler:
-                result = await crawler.arun(url=raw_html_url, config=config)
-                if result.success:
-                    return result.markdown
-                else:
-                    raise Exception("Failed to crawl raw HTML: " + result.error_message)
-        finally:
-            browser.close()
+    async with Crawl4aiDockerClient(base_url="https://crawl4ai-1027404764786.us-east4.run.app", verbose=True) as client:
+        result = await client.crawl([raw_html_url], crawler_config=config)
+        if result.success:
+            return result.markdown
+        else:
+            raise Exception("Failed to crawl raw HTML: " + result.error_message)
 
 @https_fn.on_request(memory=512, timeout_sec=30, cors=options.CorsOptions(cors_origins="*", cors_methods=["post"]))
 def extract_property_info(req: https_fn.Request) -> https_fn.Response:
@@ -40,15 +54,15 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     Receives an HTML file, url, and userId.
     Parses HTML using unstructured, extracts property info using Gemini.
     """
-    # auth_header = req.headers.get("Authorization")
-    # if not auth_header:
-    #     return https_fn.Response("Missing 'Authorization' header.", status=401)
+    auth_header = req.headers.get("Authorization")
+    if not auth_header:
+        return https_fn.Response("Missing 'Authorization' header.", status=401)
 
-    # token = auth_header.split("Bearer ")[1]
-    # try:
-    #     user_data = auth.verify_id_token(token, check_revoked=True)
-    # except Exception as e:
-    #     return https_fn.Response("Invalid 'Authorization' header.", status=403)
+    token = auth_header.split("Bearer ")[1]
+    try:
+        user_data = auth.verify_id_token(token, check_revoked=True)
+    except Exception as e:
+        return https_fn.Response("Invalid 'Authorization' header.", status=403)
 
     # Initialize Gemini client
     client = genai.Client()

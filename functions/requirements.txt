@@ -1,4 +1,4 @@
 firebase_functions~=0.1.0
 firebase-admin>=6.0.0
 google-genai
-crawl4ai
+crawl4ai==0.7.8
