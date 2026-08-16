@@ -6,11 +6,12 @@ from firebase_admin import initialize_app, firestore, auth
 import json
 import os
 import pathlib
-from google import genai
-from google.genai import types
 import asyncio
+from typing import List, Optional
+from pydantic import BaseModel, Field
 from crawl4ai.docker_client import Crawl4aiDockerClient
-from crawl4ai.async_configs import CrawlerRunConfig, CacheMode
+from crawl4ai.async_configs import CrawlerRunConfig, CacheMode, LLMConfig
+from crawl4ai.extraction_strategy import LLMExtractionStrategy
 
 set_global_options(max_instances=10)
 
@@ -37,22 +38,66 @@ def setup_fake_browser():
 # Trigger the setup immediately when the function container starts
 setup_fake_browser()
 
-async def crawl_raw_html(html_content):
+class PropertyInfo(BaseModel):
+    sourceURL: Optional[str] = Field(default=None, description="Source URL of the listing")
+    address: Optional[str] = Field(default=None, description="Full address or street name or town name")
+    price: Optional[float] = Field(default=None, description="Price in dollars")
+    leaseLength: Optional[int] = Field(default=None, description="Length in months")
+    type: Optional[str] = Field(default=None, description="Must be one of 'Apartment', 'Condo', 'Townhouse', or 'House'")
+    bedrooms: Optional[float] = Field(default=None, description="Number of bedrooms")
+    bathrooms: Optional[float] = Field(default=None, description="Number of bathrooms")
+    squareFootage: Optional[int] = Field(default=None, description="Square footage")
+    availableDate: Optional[str] = Field(default=None, description="Date string in format 'YYYY-MM-DD' or 'Available Now' or 'Available Soon'")
+    description: Optional[str] = Field(default=None, description="Property description")
+    utilitiesIncluded: List[str] = Field(default_factory=list, description="Strings in list may only include 'Water', 'Sewer', 'Heat', 'Hot Water', 'Trash', 'Electricity', 'Internet/Cable', 'Air Conditioning'")
+    dogPolicy: Optional[str] = Field(default=None, description="Must be one of 'Allowed', 'Allowed with restrictions', or 'Not allowed'")
+    catPolicy: Optional[str] = Field(default=None, description="Must be one of 'Allowed', 'Allowed with restrictions', or 'Not allowed'")
+    petFee: Optional[float] = Field(default=None, description="Pet fee amount")
+    petFeeFrequency: Optional[str] = Field(default=None, description="Must be one of 'One time', 'Monthly', or 'Yearly'")
+    parkingAvailability: Optional[str] = Field(default=None, description="Must be one of 'Garage', 'Parking Lot', 'Street Parking', 'No Parking', or 'Other'")
+    parkingFee: Optional[float] = Field(default=None, description="Parking fee amount. If parking is included in rent, set this to 0")
+    parkingFeeFrequency: Optional[str] = Field(default=None, description="Must be one of 'One time', 'Monthly', or 'Yearly'")
+    laundry: Optional[str] = Field(default=None, description="Must be one of 'In unit', 'In building', or 'Not on-site/Other'")
+
+async def crawl_and_extract_property_info(html_content: str, url: str) -> str:
     raw_html_url = f"raw:{html_content}"
-    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, excluded_tags=['form', 'footer', 'nav'], excluded_selector='.subMarketSection, .mapSection, .nearbySection, .schoolsSection, .profileV2TransportationSection, .walkScoreSection, .profileV2NearbyAmenitiesSection, .profileFooterWrapper')
+    
+    llm_strategy = LLMExtractionStrategy(
+        llm_config=LLMConfig(
+            provider="gemini/gemini-2.5-flash-lite",
+            api_token=os.getenv("GEMINI_API_KEY")
+        ),
+        schema=PropertyInfo.model_json_schema(),
+        extraction_type="schema",
+        instruction=f"""
+        You are an expert data extractor. Given the property listing website content, extract the property fields into the specified JSON schema.
+        
+        The extracted values must match the allowed values for each field.
+        If a field is missing, use null (or empty list for list types). If the content does not appear to be a property listing, return null for address.
+        Source URL: {url}
+        """,
+        input_format="html"
+    )
+
+    config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        excluded_tags=['form', 'footer', 'nav'],
+        excluded_selector='.subMarketSection, .mapSection, .nearbySection, .schoolsSection, .profileV2TransportationSection, .walkScoreSection, .profileV2NearbyAmenitiesSection, .profileFooterWrapper',
+        extraction_strategy=llm_strategy
+    )
 
     async with Crawl4aiDockerClient(base_url="https://crawl4ai-1027404764786.us-east4.run.app", verbose=True) as client:
         result = await client.crawl([raw_html_url], crawler_config=config)
         if result.success:
-            return result.markdown
+            return result.extracted_content
         else:
-            raise Exception("Failed to crawl raw HTML: " + result.error_message)
+            raise Exception("Failed to extract property info via Crawl4AI: " + (result.error_message or "Unknown error"))
 
 @https_fn.on_request(memory=512, timeout_sec=30, cors=options.CorsOptions(cors_origins="*", cors_methods=["post"]))
 def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     """
-    Receives an HTML file, url, and userId.
-    Parses HTML using unstructured, extracts property info using Gemini.
+    Receives an HTML payload, url, and userId.
+    Extracts property info using Crawl4AI LLMExtractionStrategy.
     """
     auth_header = req.headers.get("Authorization")
     if not auth_header:
@@ -64,9 +109,6 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     except Exception as e:
         return https_fn.Response("Invalid 'Authorization' header.", status=403)
 
-    # Initialize Gemini client
-    client = genai.Client()
-
     # 1. Parse parameters (URL)
     url = req.args.get("url")
 
@@ -76,20 +118,7 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     # 2. Get HTML content
     html_content = ""
     try:
-        # Check for file upload
-        # if req.files and 'file' in req.files:
-        #     file_storage = req.files['file']
-        #     html_content = file_storage.read().decode('utf-8', errors='ignore')
-        # # Check for file in a different key if 'file' missing but files exist
-        # elif req.files:
-        #     # Just take the first file
-        #     for key in req.files:
-        #         html_content = req.files[key].read().decode('utf-8', errors='ignore')
-        #         break
-        # # Fallback to raw body if content type suggests text/html or generic
-        # elif req.data:
         html_content = req.data.decode('utf-8', errors='ignore')
-        
     except Exception as e:
         print(f"Error reading HTML content: {e}")
         return https_fn.Response(f"Error reading content: {str(e)}", status=500)
@@ -97,90 +126,32 @@ def extract_property_info(req: https_fn.Request) -> https_fn.Response:
     if not html_content:
         return https_fn.Response("No HTML content received.", status=400)
 
-    # 3. Partition HTML using unstructured
+    # 3. Perform LLM extraction using Crawl4aiDockerClient
     try:
-        clean_text = asyncio.run(crawl_raw_html(html_content))
-    except Exception as e:
-        return https_fn.Response(f"Error crawling HTML: {str(e)}", status=500)
-        print(str(e))
-        # Build a safe fallback if unstructured fails (though it shouldn't for simple HTML)
-        clean_text = html_content[:50000] # truncate if raw
-
-    # 4. Call Gemini
-    try:
-        
-        prompt = f"""
-        You are an expert data extractor. given the text from a property listing website below, extract the following fields:
-        - Address (string): Full address or street name or town name
-        - Price (number)
-        - Lease length (number | null): Length in months
-        - Type (string): String must be one of "Apartment", "Condo", "Townhouse", or "House"
-        - Bedrooms (number)
-        - Bathrooms (number | null)
-        - Square Footage (number | null)
-        - Available Date (string): Date string in format "YYYY-MM-DD" or "Available Now" or "Available Soon"
-        - Description (string)
-        - Utilities Included (List[string]): Strings in list may only include "Water", "Sewer", "Heat", "Hot Water", "Trash", "Electricity", "Internet/Cable", "Air Conditioning"
-        - Dog Policy (string | null): String must be one of "Allowed", "Allowed with restrictions", or "Not allowed"
-        - Cat Policy (string | null): String must be one of "Allowed", "Allowed with restrictions", or "Not allowed"
-        - Pet fee (number | null): Leave null if no pets are allowed or not specified
-        - Pet fee frequency (string | null): String must be one of "One time", "Monthly", or "Yearly"
-        - Parking Availability (string | null): String must be one of "Garage", "Parking Lot", "Street Parking", "No Parking", or "Other"
-        - Parking fee (number | null): Leave null if no parking is available or not specified
-        - Parking fee frequency (string | null): String must be one of "One time", "Monthly", or "Yearly"
-        - Laundry (string | null): String must be one of "In unit", "In building", or "Not on-site/Other"
-
-        Source URL: {url}
-
-        Return the data in the following JSON format ONLY:
-        {{
-            "sourceURL": "{url}",
-            "address": "27 Main St, Anytown, AB 12345",
-            "price": 2500,
-            "leaseLength": 12,
-            "type": "Apartment",
-            "bedrooms": 2,
-            "bathrooms": 2,
-            "squareFootage": 1000,
-            "availableDate": "Available Now",
-            "description": "A beautiful apartment...",
-            "utilitiesIncluded": ["Water", "Heat"],
-            "dogPolicy": "Allowed",
-            "catPolicy": "Not Allowed",
-            "petFee": 60,
-            "petFeeFrequency": "Monthly",
-            "parkingAvailability": "Garage",
-            "parkingFee": 50,
-            "parkingFeeFrequency": "Monthly",
-            "laundry": "In unit"
-        }}
-
-        The extracted values must match the allowed values for each field as specified above.
-        If a field is missing, use null (or empty list for list types). If the content does not appear to be a property listing, return null for address.
-
-        Listing Content:
-        {clean_text}
-        """
-
-        response = client.models.generate_content(model='gemini-2.5-flash-lite', contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
+        extracted_raw = asyncio.run(crawl_and_extract_property_info(html_content, url))
         
         try:
-            result_json = json.loads(response.text)
+            result_json = json.loads(extracted_raw)
+            if isinstance(result_json, list) and len(result_json) > 0:
+                result_json = result_json[0]
+            if isinstance(result_json, dict):
+                result_json["sourceURL"] = url
         except json.JSONDecodeError:
-            # Fallback if model didn't output strict JSON (though mime_type helps)
-            text_resp = response.text.strip()
+            text_resp = extracted_raw.strip() if extracted_raw else ""
             if text_resp.startswith("```json"):
                 text_resp = text_resp[7:-3]
             try:
                 result_json = json.loads(text_resp)
+                if isinstance(result_json, dict):
+                    result_json["sourceURL"] = url
             except:
-                result_json = {"error": "Failed to parse JSON from AI response", "raw": response.text}
-        
-        return https_fn.Response(json.dumps(result_json), mimetype='application/json', status=200)                
+                result_json = {"error": "Failed to parse JSON from AI response", "raw": extracted_raw}
+
+        return https_fn.Response(json.dumps(result_json), mimetype='application/json', status=200)
 
     except Exception as e:
-        print(f"Error calling Gemini: {e}")
-        return https_fn.Response(f"AI processing error: {str(e)}", status=500)
+        print(f"Error extracting property info: {e}")
+        return https_fn.Response(f"AI extraction error: {str(e)}", status=500)
 
 
 @firestore_fn.on_document_created(document="users/{userId}")
